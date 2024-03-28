@@ -17,7 +17,8 @@ use rustc_hash::FxHashSet;
 use std::borrow::Cow;
 use std::collections::hash_set;
 use std::hash::{Hash, Hasher};
-use std::path::Path;
+use std::ops::DerefMut;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::vec;
 use std::{any::TypeId, marker::PhantomData, ops::Deref};
@@ -25,10 +26,7 @@ use std::{any::TypeId, marker::PhantomData, ops::Deref};
 use crate::diagnostics::MigrationDiagnostic;
 use crate::CliDiagnostic;
 
-use super::{
-    eslint_barrel, eslint_import, eslint_jest, eslint_jsxa11y, eslint_react, eslint_react_hooks,
-    eslint_typescript, eslint_unicorn,
-};
+use super::{eslint_jsxa11y, eslint_typescript, eslint_unicorn};
 
 /// This modules includes implementations for deserializing an eslint configuration.
 ///
@@ -82,6 +80,8 @@ const FLAT_CONFIG_FILES: [&str; 3] = [
 /// Other errors (File Not found, unspported config format, ...) are directly returned.
 ///
 /// We extract the ESlint configuration from a JavaScript file, by invocating `node`.
+///
+/// The `extends` field is recusively resolved.
 pub(crate) fn read_eslint_config(
     fs: &DynRef<'_, dyn FileSystem>,
     console: &mut dyn Console,
@@ -122,16 +122,10 @@ fn load_config(
             )
         },
         Some("js" | "cjs") => {
-            let path_str = path.to_string_lossy();
-            let output = Command::new("node")
-                .arg("--eval")
-                .arg(format!("import('{path_str}').then((c) => console.log(JSON.stringify(c.default)))"))
-                .output()?;
+            let NodeResolveResult { content, ..} = load_config_with_node(&path.to_string_lossy())?;
             deserialize_from_json_str::<ConfigData>(
-                &String::from_utf8_lossy(&output.stdout),
-                JsonParserOptions::default()
-                    .with_allow_trailing_commas()
-                    .with_allow_comments(),
+                &content,
+                JsonParserOptions::default(),
                 "",
             )
         },
@@ -150,12 +144,246 @@ fn load_config(
         let diagnostic = diagnostic.with_file_path(path_str.to_string());
         console.error(markup! {{PrintDiagnostic::simple(&diagnostic)}});
     }
-    if let Some(result) = deserialized {
+    if let Some(mut result) = deserialized {
+        // recursively resolve the `extends` field.
+        while !result.extends.is_empty() {
+            resolve_extends(&mut result, console);
+        }
         Ok(result)
     } else {
         Err(CliDiagnostic::MigrateError(MigrationDiagnostic {
             reason: "Could not deserialize the Eslint configuration file".to_string(),
         }))
+    }
+}
+
+#[derive(Debug)]
+struct NodeResolveResult {
+    /// Resolved path of the file
+    resolved_path: String,
+    /// File content
+    content: String,
+}
+
+/// Imports `specifier` using Node's `import()` or node's `require()` and
+/// returns the JSONified content of its default export.
+fn load_config_with_node(specifier: &str) -> Result<NodeResolveResult, CliDiagnostic> {
+    let content_output = Command::new("node")
+        .arg("--eval")
+        .arg(format!(
+            "import('{specifier}').then((c) => console.log(JSON.stringify(c.default)))"
+        ))
+        .output();
+    match content_output {
+        Err(_) => {
+            Err(CliDiagnostic::MigrateError(MigrationDiagnostic {
+                reason: "The `node` program doesn't exist or cannot be invoked by Biome.\n`node` is invoked to resolve ESlint configurations written in JavaScript.\nThis includes shared configurations and plugin configurations imported with ESlint's `extends`.".to_string()
+            }))
+        },
+        Ok(output) => {
+            let path_output = Command::new("node")
+                .arg("--print")
+                .arg(format!(
+                    "require.resolve('{specifier}')"
+                ))
+                .output();
+            let resolved_path = path_output.ok().map_or(String::new(), |path_output| String::from_utf8_lossy(&path_output.stdout).trim().to_string());
+            if !output.stderr.is_empty() {
+                // Try with `require` before giving up.
+                let output2 = Command::new("node")
+                    .arg("--print")
+                    .arg(format!(
+                        "JSON.stringify(require('{specifier}'))"
+                    ))
+                    .output();
+                if let Ok(output2) = output2 {
+                    if output2.stderr.is_empty() {
+                        return Ok(NodeResolveResult {
+                            content: String::from_utf8_lossy(&output2.stdout).to_string(),
+                            resolved_path,
+                        });
+                    }
+                }
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(CliDiagnostic::MigrateError(MigrationDiagnostic {
+                    reason: format!("`node` was invoked to resolve an ESlint configuration. This invocation failed with the following error:\n{stderr}")
+                }));
+            }
+            Ok(NodeResolveResult {
+                content: String::from_utf8_lossy(&output.stdout).to_string(),
+                resolved_path,
+            })
+        }
+    }
+}
+
+/// Returns the configuration from a preset or a nerror if the resolution failed.
+///
+/// This handles:
+/// - native ESlint presets such as `eslint:recommended`;
+/// - plugin presets such as `plugin:@typescript-eslint/recommended`;
+/// - and shared configurations such as `standard`.
+fn load_eslint_extends_config(name: &str) -> Result<ConfigData, CliDiagnostic> {
+    let (specifier, resolved_path, deserialized) = if let Some((protocol, rest)) =
+        name.split_once(':')
+    {
+        let (module_name, config_name) = match protocol {
+            // e.g. `eslint:recommended`
+            //      - module_name: `@eslint/js`
+            //      - config_name: `recommended`
+            "eslint" => (Cow::Borrowed("@eslint/js"), rest),
+            // e.g. `plugin:@typescript-eslint/recommended`
+            //      - module_name: `@typescript-eslint/eslint-plugin`
+            //      - config_name: `recommended`
+            // e.g. `plugin:unicorn/recommended`
+            //      - module_name: `eslint-plugin-unicorn`
+            //      - config_name: `recommended`
+            "plugin" => {
+                let Some(config_name) = rest.split('/').last() else {
+                    return Err(CliDiagnostic::MigrateError(MigrationDiagnostic {
+                        reason: format!(
+                            "The configuration {rest} cannot be resolved. Make sure that your ESlint configuration file is valid."
+                        ),
+                    }));
+                };
+                let rest = rest.trim_end_matches(config_name);
+                let module_name = rest.trim_end_matches('/');
+                let module_name = EslintPackage::Plugin.resolve_name(module_name);
+                (module_name, config_name)
+            }
+            name => {
+                return Err(CliDiagnostic::MigrateError(MigrationDiagnostic {
+                    reason: format!(
+                        "The module {name} cannot be resolved. This is likely an internal error."
+                    ),
+                }));
+            }
+        };
+        // load ESlint preset
+        let Ok(NodeResolveResult {
+            content,
+            resolved_path,
+        }) = load_config_with_node(&module_name)
+        else {
+            return Err(CliDiagnostic::MigrateError(MigrationDiagnostic {
+                reason: format!(
+                    "The module '{rest}' cannot be loaded. Make sure that the module exists."
+                ),
+            }));
+        };
+        let deserialized =
+            deserialize_from_json_str::<PluginExport>(&content, JsonParserOptions::default(), "")
+                .into_deserialized();
+        if let Some(mut deserialized) = deserialized {
+            let deserialized = deserialized.configs.remove(config_name);
+            if deserialized.is_none() {
+                return Err(CliDiagnostic::MigrateError(MigrationDiagnostic {
+                    reason: format!("The ESlint configuration '{config_name}' cannot be extracted from the module '{module_name}'. Make sure that '{config_name}' is a valid configuration name.")
+                }));
+            }
+            (module_name, resolved_path, deserialized)
+        } else {
+            (module_name, resolved_path, None)
+        }
+    } else {
+        // load ESlint shared config
+        let module_name = if matches!(name.as_bytes().first(), Some(b'.' | b'/' | b'#')) {
+            // local path
+            Cow::Borrowed(name)
+        } else {
+            EslintPackage::Config.resolve_name(name)
+        };
+        let Ok(NodeResolveResult {
+            content,
+            resolved_path,
+        }) = load_config_with_node(&module_name)
+        else {
+            return Err(CliDiagnostic::MigrateError(MigrationDiagnostic {
+                reason: format!(
+                    "The module '{module_name}' cannot be loaded. Make sure that the module exists."
+                ),
+            }));
+        };
+        let deserialized =
+            deserialize_from_json_str::<ConfigData>(&content, JsonParserOptions::default(), "")
+                .into_deserialized();
+        (module_name, resolved_path, deserialized)
+    };
+    let Some(mut deserialized) = deserialized else {
+        return Err(CliDiagnostic::MigrateError(MigrationDiagnostic {
+            reason: format!("The ESlint configuration of the module '{specifier}' cannot be extracted. This is likely an internal error.")
+        }));
+    };
+    // Resolve relative path in `extends`.
+    deserialized.extends.iter_mut().for_each(|extends_item| {
+        if extends_item.starts_with('.') {
+            let Some(resolved_path) = Path::new(&resolved_path).parent() else {
+                return;
+            };
+            let mut path = PathBuf::new();
+            path.push(resolved_path);
+            path.push(Path::new(&extends_item));
+            *extends_item = path.to_string_lossy().to_string();
+        }
+    });
+    Ok(deserialized)
+}
+
+/// Load and merge included configuration via `self.extends`.
+///
+/// Unknown presets are ignored.
+/// `self.extends` is replaced by an empty array.
+fn resolve_extends(config: &mut ConfigData, console: &mut dyn Console) {
+    let extensions: Vec<_> = config
+        .extends
+        .0
+        .iter()
+        .filter_map(|preset| match load_eslint_extends_config(preset) {
+            Ok(config) => Some(config),
+            Err(diag) => {
+                console.error(markup! {{PrintDiagnostic::simple(&diag)}});
+                None
+            }
+        })
+        .collect();
+    config.extends.0.clear();
+    for ext in extensions {
+        config.merge_with(ext);
+    }
+}
+
+/// ESlint to specific rules to resolve a module name.
+/// See https://eslint.org/docs/latest/extend/shareable-configs#using-a-shareable-config
+/// See also https://eslint.org/docs/latest/extend/plugins
+#[derive(Debug)]
+enum EslintPackage {
+    Config,
+    Plugin,
+}
+impl EslintPackage {
+    fn resolve_name<'a>(&self, name: &'a str) -> Cow<'a, str> {
+        let artifact = match self {
+            EslintPackage::Config => "eslint-config-",
+            EslintPackage::Plugin => "eslint-plugin-",
+        };
+        debug_assert!(matches!(artifact, "eslint-plugin-" | "eslint-config-"));
+        if name.starts_with('@') {
+            // handle scoped module
+            if let Some((scope, scoped)) = name.split_once('/') {
+                if scoped.starts_with(artifact) {
+                    Cow::Borrowed(name)
+                } else {
+                    Cow::Owned(format!("{scope}/{artifact}{scoped}"))
+                }
+            } else {
+                let artifact = artifact.trim_end_matches('-');
+                Cow::Owned(format!("{name}/{artifact}"))
+            }
+        } else if name.starts_with(artifact) {
+            Cow::Borrowed(name)
+        } else {
+            Cow::Owned(format!("{artifact}{name}"))
+        }
     }
 }
 
@@ -170,162 +398,6 @@ pub(crate) struct ConfigData {
     pub(crate) rules: Rules,
     pub(crate) overrides: Vec<OverrideConfigData>,
 }
-impl ConfigData {
-    /// Returns the configuration from a preset if any.
-    ///
-    /// This handles native ESlint presets such as `eslint:recommended`,
-    /// and plugin presets such as `plugin:@typescript-eslint/recommended`.
-    pub(crate) fn from_preset(name: &str) -> Option<ConfigData> {
-        let rules = match name {
-            "eslint:recommended" => Rules::from_iter(ESLINT_RECOMMENDED.into_iter()),
-            "eslint:all" => Rules::from_iter(ESLINT_ALL.into_iter()),
-            "plugin:barrel/recommended" => Rules::from_iter(eslint_barrel::RECOMMENDED.into_iter()),
-            "plugin:import/errors" => Rules::from_iter(eslint_import::ERRORS.into_iter()),
-            "plugin:import/recommended" => Rules::from_iter(
-                eslint_import::ERRORS
-                    .into_iter()
-                    .chain(eslint_import::WARNINGS),
-            ),
-            "plugin:import/warnings" => Rules::from_iter(eslint_import::WARNINGS.into_iter()),
-            "plugin:jest/recommended" => Rules::from_iter(eslint_jest::RECOMMENDED.into_iter()),
-            "plugin:jest/style" => Rules::from_iter(eslint_jest::STYLE.into_iter()),
-            "plugin:jest/all" => Rules::from_iter(
-                eslint_jest::RECOMMENDED
-                    .into_iter()
-                    .chain(eslint_jest::NON_RECOMMENDED_ERROR),
-            ),
-            "plugin:jsx-a11y/recommended" => Rules::from_iter(
-                eslint_jsxa11y::STRICT
-                    .into_iter()
-                    .chain(eslint_jsxa11y::DISABLED_IN_RECOMMENDED),
-            ),
-            "plugin:jsx-a11y/strict" => Rules::from_iter(eslint_jsxa11y::STRICT.into_iter()),
-            "plugin:react/all" => Rules::from_iter(
-                eslint_react::RECOMMENDED
-                    .into_iter()
-                    .chain(eslint_react::NON_RECOMMENDED),
-            ),
-            "plugin:react/jsx-runtime" => Rules::from_iter(eslint_react::JSX_RUNTIME.into_iter()),
-            "plugin:react-hooks/recommended" => {
-                Rules::from_iter(eslint_react_hooks::RECOMMENDED.into_iter())
-            }
-            "plugin:react/recommended" => Rules::from_iter(eslint_react::RECOMMENDED.into_iter()),
-            "plugin:@typescript-eslint/base" => Rules::default(),
-            "plugin:@typescript-eslint/recommended" => {
-                Rules::from_iter(eslint_typescript::RECOMMENDED.into_iter())
-            }
-            "plugin:@typescript-eslint/recommended-type-checked-only" => {
-                Rules::from_iter(eslint_typescript::RECOMMENDED_TYPE_CHECKED_ONLY.into_iter())
-            }
-            "plugin:@typescript-eslint/recommended-type-checked" => Rules::from_iter(
-                eslint_typescript::RECOMMENDED
-                    .into_iter()
-                    .chain(eslint_typescript::RECOMMENDED_TYPE_CHECKED_ONLY),
-            ),
-            "plugin:@typescript-eslint/strict" => {
-                Rules::from_iter(eslint_typescript::STRICT.into_iter())
-            }
-            "plugin:@typescript-eslint/strict-type-checked-only" => {
-                Rules::from_iter(eslint_typescript::STRICT_YYPE_CHECKED_ONLY.into_iter())
-            }
-            "plugin:@typescript-eslint/strict-type-checked" => Rules::from_iter(
-                eslint_typescript::STRICT
-                    .into_iter()
-                    .chain(eslint_typescript::STRICT_YYPE_CHECKED_ONLY),
-            ),
-            "plugin:@typescript-eslint/stylistic" => {
-                Rules::from_iter(eslint_typescript::STYLISTIC.into_iter())
-            }
-            "plugin:@typescript-eslint/stylistic-type-checked-only" => {
-                Rules::from_iter(eslint_typescript::STYLISTIC_TYPE_CHECKED_ONLY.into_iter())
-            }
-            "plugin:@typescript-eslint/stylistic-type-checked" => Rules::from_iter(
-                eslint_typescript::STYLISTIC
-                    .into_iter()
-                    .chain(eslint_typescript::STYLISTIC_TYPE_CHECKED_ONLY),
-            ),
-            "plugin:@typescript-eslint/disable-type-checked" => {
-                Rules::from_iter(eslint_typescript::DISABLE_TYPE_CHECKED.into_iter())
-            }
-            "plugin:@typescript-eslint/all" => Rules::from_iter(eslint_typescript::ALL.into_iter()),
-            "plugin:unicorn/recommeded" => {
-                Rules::from_iter(eslint_unicorn::RECOMMENDED.into_iter())
-            }
-            "plugin:unicorn/all" => Rules::from_iter(
-                eslint_unicorn::RECOMMENDED
-                    .into_iter()
-                    .chain(eslint_unicorn::NON_RECOMMENDED),
-            ),
-            name => {
-                if let Some((protocol, _imported)) = name.split_once(':') {
-                    match protocol {
-                        "plugin" => {
-                            // TODO: we could handle plugins here
-                        }
-                        _ => {}
-                    }
-                } else {
-                    let name = if name.starts_with('@') {
-                        if let Some((scope, scoped)) = name.split_once('/') {
-                            if scoped.starts_with("eslint-config-") {
-                                Cow::Borrowed(name)
-                            } else {
-                                Cow::Owned(format!("{scope}/eslint-config-{scoped}"))
-                            }
-                        } else {
-                            Cow::Owned(format!("{name}/eslint-config"))
-                        }
-                    } else if name.starts_with("eslint-config-") {
-                        Cow::Borrowed(name)
-                    } else {
-                        Cow::Owned(format!("eslint-config-{name}"))
-                    };
-                    let Ok(output) = Command::new("node")
-                        .arg("--eval")
-                        .arg(format!(
-                            "import('{name}').then((c) => console.log(JSON.stringify(c.default)))"
-                        ))
-                        .output()
-                    else {
-                        return None;
-                    };
-                    let deserialized = deserialize_from_json_str::<ConfigData>(
-                        &String::from_utf8_lossy(&output.stdout),
-                        JsonParserOptions::default()
-                            .with_allow_trailing_commas()
-                            .with_allow_comments(),
-                        "",
-                    );
-                    if let Some(deserialized) = deserialized.into_deserialized() {
-                        return Some(deserialized);
-                    }
-                }
-                return None;
-            }
-        };
-        Some(ConfigData {
-            rules,
-            ..Default::default()
-        })
-    }
-
-    /// Load and merge included configuration via `self.extends`.
-    ///
-    /// Unknown presets are ignored.
-    /// `self.extends` is replaced by an empty array.
-    pub(crate) fn resolve_extends(&mut self) {
-        let extensions: Vec<_> = self
-            .extends
-            .0
-            .iter()
-            .filter_map(|preset| Self::from_preset(preset))
-            .collect();
-        self.extends = Shorthand::default();
-        for ext in extensions {
-            self.merge_with(ext);
-        }
-    }
-}
 impl Merge for ConfigData {
     fn merge_with(&mut self, mut other: Self) {
         self.extends.merge_with(other.extends);
@@ -334,6 +406,14 @@ impl Merge for ConfigData {
         self.rules.merge_with(other.rules);
         self.overrides.append(&mut other.overrides);
     }
+}
+
+//? ESlint plugins export metadata in their main export.
+/// This includes presets in the `configs` field.
+#[derive(Debug, Default, Deserializable)]
+#[deserializable(unknown_fields = "allow")]
+pub(crate) struct PluginExport {
+    pub(crate) configs: FxHashMap<String, ConfigData>,
 }
 
 #[derive(Debug)]
@@ -400,6 +480,11 @@ impl<T> Deref for Shorthand<T> {
     type Target = Vec<T>;
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+impl<T> DerefMut for Shorthand<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
     }
 }
 impl<T> IntoIterator for Shorthand<T> {
@@ -588,15 +673,6 @@ impl Deserializable for NumberOrString {
 
 #[derive(Debug, Default)]
 pub(crate) struct Rules(pub(crate) FxHashSet<Rule>);
-impl Rules {
-    fn from_iter(rules: impl Iterator<Item = (&'static str, Severity)>) -> Self {
-        Self(
-            rules
-                .map(|(name, severity)| Rule::new(name, severity))
-                .collect(),
-        )
-    }
-}
 impl Merge for Rules {
     fn merge_with(&mut self, other: Self) {
         self.0.extend(other.0);
@@ -736,26 +812,9 @@ pub(crate) enum Rule {
     TypeScriptArrayType(RuleConf<eslint_typescript::ArrayTypeOptions>),
     TypeScriptNamingConvention(RuleConf<Box<eslint_typescript::NamingConventionSelection>>),
     UnicornFilenameCase(RuleConf<eslint_unicorn::FilenameCaseOptions>),
-    // If ypu add new variants, dont forget to update [Rule::new] and [Rules::deserialize].
+    // If ypu add new variants, dont forget to update [Rules::deserialize].
 }
 impl Rule {
-    pub(crate) fn new(name: &'static str, severity: Severity) -> Self {
-        // Correctly map to the corresponding rule variant.
-        // This is important to get the equivalent Biome configuration of a rule.
-        match name {
-            "no-restricted-globals" => Rule::NoRestrictedGlobals(RuleConf::Severity(severity)),
-            "jsx-a11y/aria-role" => Rule::Jsxa11yArioaRoles(RuleConf::Severity(severity)),
-            "@typescript-eslint/array-type" => {
-                Rule::TypeScriptArrayType(RuleConf::Severity(severity))
-            }
-            "@typescript-eslint/naming-convention" => {
-                Rule::TypeScriptNamingConvention(RuleConf::Severity(severity))
-            }
-            "unicorn/filename-case" => Rule::UnicornFilenameCase(RuleConf::Severity(severity)),
-            name => Self::Any(Cow::Borrowed(name), severity),
-        }
-    }
-
     pub(crate) fn name(&self) -> Cow<'static, str> {
         match self {
             Rule::Any(name, _) => name.clone(),
@@ -780,273 +839,3 @@ impl Hash for Rule {
         self.name().hash(state);
     }
 }
-
-/// `eslint:recommended` preset.
-/// See https://github.com/eslint/eslint/blob/main/packages/js/src/configs/eslint-recommended.js
-const ESLINT_RECOMMENDED: [(&str, Severity); 61] = [
-    ("constructor-super", Severity::Error),
-    ("for-direction", Severity::Error),
-    ("getter-return", Severity::Error),
-    ("no-async-promise-executor", Severity::Error),
-    ("no-case-declarations", Severity::Error),
-    ("no-class-assign", Severity::Error),
-    ("no-compare-neg-zero", Severity::Error),
-    ("no-cond-assign", Severity::Error),
-    ("no-const-assign", Severity::Error),
-    ("no-constant-binary-expression", Severity::Error),
-    ("no-constant-condition", Severity::Error),
-    ("no-control-regex", Severity::Error),
-    ("no-debugger", Severity::Error),
-    ("no-delete-var", Severity::Error),
-    ("no-dupe-args", Severity::Error),
-    ("no-dupe-class-members", Severity::Error),
-    ("no-dupe-else-if", Severity::Error),
-    ("no-dupe-keys", Severity::Error),
-    ("no-duplicate-case", Severity::Error),
-    ("no-empty", Severity::Error),
-    ("no-empty-character-class", Severity::Error),
-    ("no-empty-pattern", Severity::Error),
-    ("no-empty-static-block", Severity::Error),
-    ("no-ex-assign", Severity::Error),
-    ("no-extra-boolean-cast", Severity::Error),
-    ("no-fallthrough", Severity::Error),
-    ("no-func-assign", Severity::Error),
-    ("no-global-assign", Severity::Error),
-    ("no-import-assign", Severity::Error),
-    ("no-invalid-regexp", Severity::Error),
-    ("no-irregular-whitespace", Severity::Error),
-    ("no-loss-of-precision", Severity::Error),
-    ("no-misleading-character-class", Severity::Error),
-    ("no-new-native-nonconstructor", Severity::Error),
-    ("no-nonoctal-decimal-escape", Severity::Error),
-    ("no-obj-calls", Severity::Error),
-    ("no-octal", Severity::Error),
-    ("no-prototype-builtins", Severity::Error),
-    ("no-redeclare", Severity::Error),
-    ("no-regex-spaces", Severity::Error),
-    ("no-self-assign", Severity::Error),
-    ("no-setter-return", Severity::Error),
-    ("no-shadow-restricted-names", Severity::Error),
-    ("no-sparse-arrays", Severity::Error),
-    ("no-this-before-super", Severity::Error),
-    ("no-undef", Severity::Error),
-    ("no-unexpected-multiline", Severity::Error),
-    ("no-unreachable", Severity::Error),
-    ("no-unsafe-finally", Severity::Error),
-    ("no-unsafe-negation", Severity::Error),
-    ("no-unsafe-optional-chaining", Severity::Error),
-    ("no-unused-labels", Severity::Error),
-    ("no-unused-private-class-members", Severity::Error),
-    ("no-unused-vars", Severity::Error),
-    ("no-useless-backreference", Severity::Error),
-    ("no-useless-catch", Severity::Error),
-    ("no-useless-escape", Severity::Error),
-    ("no-with", Severity::Error),
-    ("require-yield", Severity::Error),
-    ("use-isnan", Severity::Error),
-    ("valid-typeof", Severity::Error),
-];
-
-/// `eslint:all` preset.
-/// See https://github.com/eslint/eslint/blob/main/packages/js/src/configs/eslint-recommended.js
-const ESLINT_ALL: [(&str, Severity); 199] = [
-    ("accessor-pairs", Severity::Error),
-    ("array-callback-return", Severity::Error),
-    ("arrow-body-style", Severity::Error),
-    ("block-scoped-var", Severity::Error),
-    ("camelcase", Severity::Error),
-    ("capitalized-comments", Severity::Error),
-    ("class-methods-use-this", Severity::Error),
-    ("complexity", Severity::Error),
-    ("consistent-return", Severity::Error),
-    ("consistent-this", Severity::Error),
-    ("constructor-super", Severity::Error),
-    ("curly", Severity::Error),
-    ("default-case", Severity::Error),
-    ("default-case-last", Severity::Error),
-    ("default-param-last", Severity::Error),
-    ("dot-notation", Severity::Error),
-    ("eqeqeq", Severity::Error),
-    ("for-direction", Severity::Error),
-    ("func-name-matching", Severity::Error),
-    ("func-names", Severity::Error),
-    ("func-style", Severity::Error),
-    ("getter-return", Severity::Error),
-    ("grouped-accessor-pairs", Severity::Error),
-    ("guard-for-in", Severity::Error),
-    ("id-denylist", Severity::Error),
-    ("id-length", Severity::Error),
-    ("id-match", Severity::Error),
-    ("init-declarations", Severity::Error),
-    ("line-comment-position", Severity::Error),
-    ("logical-assignment-operators", Severity::Error),
-    ("max-classes-per-file", Severity::Error),
-    ("max-depth", Severity::Error),
-    ("max-lines", Severity::Error),
-    ("max-lines-per-function", Severity::Error),
-    ("max-nested-callbacks", Severity::Error),
-    ("max-params", Severity::Error),
-    ("max-statements", Severity::Error),
-    ("multiline-comment-style", Severity::Error),
-    ("new-cap", Severity::Error),
-    ("no-alert", Severity::Error),
-    ("no-array-constructor", Severity::Error),
-    ("no-async-promise-executor", Severity::Error),
-    ("no-await-in-loop", Severity::Error),
-    ("no-bitwise", Severity::Error),
-    ("no-caller", Severity::Error),
-    ("no-case-declarations", Severity::Error),
-    ("no-class-assign", Severity::Error),
-    ("no-compare-neg-zero", Severity::Error),
-    ("no-cond-assign", Severity::Error),
-    ("no-console", Severity::Error),
-    ("no-const-assign", Severity::Error),
-    ("no-constant-binary-expression", Severity::Error),
-    ("no-constant-condition", Severity::Error),
-    ("no-constructor-return", Severity::Error),
-    ("no-continue", Severity::Error),
-    ("no-control-regex", Severity::Error),
-    ("no-debugger", Severity::Error),
-    ("no-delete-var", Severity::Error),
-    ("no-div-regex", Severity::Error),
-    ("no-dupe-args", Severity::Error),
-    ("no-dupe-class-members", Severity::Error),
-    ("no-dupe-else-if", Severity::Error),
-    ("no-dupe-keys", Severity::Error),
-    ("no-duplicate-case", Severity::Error),
-    ("no-duplicate-imports", Severity::Error),
-    ("no-else-return", Severity::Error),
-    ("no-empty", Severity::Error),
-    ("no-empty-character-class", Severity::Error),
-    ("no-empty-function", Severity::Error),
-    ("no-empty-pattern", Severity::Error),
-    ("no-empty-static-block", Severity::Error),
-    ("no-eq-null", Severity::Error),
-    ("no-eval", Severity::Error),
-    ("no-ex-assign", Severity::Error),
-    ("no-extend-native", Severity::Error),
-    ("no-extra-bind", Severity::Error),
-    ("no-extra-boolean-cast", Severity::Error),
-    ("no-extra-label", Severity::Error),
-    ("no-fallthrough", Severity::Error),
-    ("no-func-assign", Severity::Error),
-    ("no-global-assign", Severity::Error),
-    ("no-implicit-coercion", Severity::Error),
-    ("no-implicit-globals", Severity::Error),
-    ("no-implied-eval", Severity::Error),
-    ("no-import-assign", Severity::Error),
-    ("no-inline-comments", Severity::Error),
-    ("no-inner-declarations", Severity::Error),
-    ("no-invalid-regexp", Severity::Error),
-    ("no-invalid-this", Severity::Error),
-    ("no-irregular-whitespace", Severity::Error),
-    ("no-iterator", Severity::Error),
-    ("no-label-var", Severity::Error),
-    ("no-labels", Severity::Error),
-    ("no-lone-blocks", Severity::Error),
-    ("no-lonely-if", Severity::Error),
-    ("no-loop-func", Severity::Error),
-    ("no-loss-of-precision", Severity::Error),
-    ("no-magic-numbers", Severity::Error),
-    ("no-misleading-character-class", Severity::Error),
-    ("no-multi-assign", Severity::Error),
-    ("no-multi-str", Severity::Error),
-    ("no-negated-condition", Severity::Error),
-    ("no-nested-ternary", Severity::Error),
-    ("no-new", Severity::Error),
-    ("no-new-func", Severity::Error),
-    ("no-new-native-nonconstructor", Severity::Error),
-    ("no-new-wrappers", Severity::Error),
-    ("no-nonoctal-decimal-escape", Severity::Error),
-    ("no-obj-calls", Severity::Error),
-    ("no-object-constructor", Severity::Error),
-    ("no-octal", Severity::Error),
-    ("no-octal-escape", Severity::Error),
-    ("no-param-reassign", Severity::Error),
-    ("no-plusplus", Severity::Error),
-    ("no-promise-executor-return", Severity::Error),
-    ("no-proto", Severity::Error),
-    ("no-prototype-builtins", Severity::Error),
-    ("no-redeclare", Severity::Error),
-    ("no-regex-spaces", Severity::Error),
-    ("no-restricted-exports", Severity::Error),
-    ("no-restricted-globals", Severity::Error),
-    ("no-restricted-imports", Severity::Error),
-    ("no-restricted-properties", Severity::Error),
-    ("no-restricted-syntax", Severity::Error),
-    ("no-return-assign", Severity::Error),
-    ("no-script-url", Severity::Error),
-    ("no-self-assign", Severity::Error),
-    ("no-self-compare", Severity::Error),
-    ("no-sequences", Severity::Error),
-    ("no-setter-return", Severity::Error),
-    ("no-shadow", Severity::Error),
-    ("no-shadow-restricted-names", Severity::Error),
-    ("no-sparse-arrays", Severity::Error),
-    ("no-template-curly-in-string", Severity::Error),
-    ("no-ternary", Severity::Error),
-    ("no-this-before-super", Severity::Error),
-    ("no-throw-literal", Severity::Error),
-    ("no-undef", Severity::Error),
-    ("no-undef-init", Severity::Error),
-    ("no-undefined", Severity::Error),
-    ("no-underscore-dangle", Severity::Error),
-    ("no-unexpected-multiline", Severity::Error),
-    ("no-unmodified-loop-condition", Severity::Error),
-    ("no-unneeded-ternary", Severity::Error),
-    ("no-unreachable", Severity::Error),
-    ("no-unreachable-loop", Severity::Error),
-    ("no-unsafe-finally", Severity::Error),
-    ("no-unsafe-negation", Severity::Error),
-    ("no-unsafe-optional-chaining", Severity::Error),
-    ("no-unused-expressions", Severity::Error),
-    ("no-unused-labels", Severity::Error),
-    ("no-unused-private-class-members", Severity::Error),
-    ("no-unused-vars", Severity::Error),
-    ("no-use-before-define", Severity::Error),
-    ("no-useless-assignment", Severity::Error),
-    ("no-useless-backreference", Severity::Error),
-    ("no-useless-call", Severity::Error),
-    ("no-useless-catch", Severity::Error),
-    ("no-useless-computed-key", Severity::Error),
-    ("no-useless-concat", Severity::Error),
-    ("no-useless-constructor", Severity::Error),
-    ("no-useless-escape", Severity::Error),
-    ("no-useless-rename", Severity::Error),
-    ("no-useless-return", Severity::Error),
-    ("no-var", Severity::Error),
-    ("no-void", Severity::Error),
-    ("no-warning-comments", Severity::Error),
-    ("no-with", Severity::Error),
-    ("object-shorthand", Severity::Error),
-    ("one-var", Severity::Error),
-    ("operator-assignment", Severity::Error),
-    ("prefer-arrow-callback", Severity::Error),
-    ("prefer-const", Severity::Error),
-    ("prefer-destructuring", Severity::Error),
-    ("prefer-exponentiation-operator", Severity::Error),
-    ("prefer-named-capture-group", Severity::Error),
-    ("prefer-numeric-literals", Severity::Error),
-    ("prefer-object-has-own", Severity::Error),
-    ("prefer-object-spread", Severity::Error),
-    ("prefer-promise-reject-errors", Severity::Error),
-    ("prefer-regex-literals", Severity::Error),
-    ("prefer-rest-params", Severity::Error),
-    ("prefer-spread", Severity::Error),
-    ("prefer-template", Severity::Error),
-    ("radix", Severity::Error),
-    ("require-atomic-updates", Severity::Error),
-    ("require-await", Severity::Error),
-    ("require-unicode-regexp", Severity::Error),
-    ("require-yield", Severity::Error),
-    ("sort-imports", Severity::Error),
-    ("sort-keys", Severity::Error),
-    ("sort-vars", Severity::Error),
-    ("strict", Severity::Error),
-    ("symbol-description", Severity::Error),
-    ("unicode-bom", Severity::Error),
-    ("use-isnan", Severity::Error),
-    ("valid-typeof", Severity::Error),
-    ("vars-on-top", Severity::Error),
-    ("yoda", Severity::Error),
-];

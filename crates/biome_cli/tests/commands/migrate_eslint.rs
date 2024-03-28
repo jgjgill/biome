@@ -273,38 +273,6 @@ fn migrate_eslintrcjson_rule_options() {
 }
 
 #[test]
-fn migrate_eslintrcjson_presets() {
-    let biomejson = r#"{ "linter": { "enabled": true } }"#;
-    let eslintrc = r#"{
-        "extends": ["eslint:recommended", "plugin:@typescript-eslint/recommended"],
-        "rules": {
-            // Overrides recommended
-            "eqeqeq": "off"
-        },
-    }"#;
-
-    let mut fs = MemoryFileSystem::default();
-    fs.insert(Path::new("biome.json").into(), biomejson.as_bytes());
-    fs.insert(Path::new(".eslintrc.json").into(), eslintrc.as_bytes());
-
-    let mut console = BufferConsole::default();
-    let result = run_cli(
-        DynRef::Borrowed(&mut fs),
-        &mut console,
-        Args::from(["migrate", "eslint"].as_slice()),
-    );
-
-    assert!(result.is_ok(), "run_cli returned {result:?}");
-    assert_cli_snapshot(SnapshotPayload::new(
-        module_path!(),
-        "migrate_eslintrcjson_presets",
-        fs,
-        console,
-        result,
-    ));
-}
-
-#[test]
 fn migrate_eslintrcjson_empty() {
     let biomejson = r#"{ "linter": { "enabled": true } }
 "#;

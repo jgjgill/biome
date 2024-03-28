@@ -37,6 +37,7 @@ gen-bindings:
 gen-lint:
   cargo codegen analyzer
   cargo codegen-configuration
+  cargo codegen-eslint-migrate
   just gen-bindings
   just format
   cargo lintdoc
