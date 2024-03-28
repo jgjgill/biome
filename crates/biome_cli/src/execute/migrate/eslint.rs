@@ -127,9 +127,8 @@ fn load_config(
                 .arg("--eval")
                 .arg(format!("import('{path_str}').then((c) => console.log(JSON.stringify(c.default)))"))
                 .output()?;
-            let content = String::from_utf8_lossy(&output.stdout);
             deserialize_from_json_str::<ConfigData>(
-                &content,
+                &String::from_utf8_lossy(&output.stdout),
                 JsonParserOptions::default()
                     .with_allow_trailing_commas()
                     .with_allow_comments(),
@@ -257,7 +256,50 @@ impl ConfigData {
                     .into_iter()
                     .chain(eslint_unicorn::NON_RECOMMENDED),
             ),
-            _ => {
+            name => {
+                if let Some((protocol, _imported)) = name.split_once(':') {
+                    match protocol {
+                        "plugin" => {
+                            // TODO: we could handle plugins here
+                        }
+                        _ => {}
+                    }
+                } else {
+                    let name = if name.starts_with('@') {
+                        if let Some((scope, scoped)) = name.split_once('/') {
+                            if scoped.starts_with("eslint-config-") {
+                                Cow::Borrowed(name)
+                            } else {
+                                Cow::Owned(format!("{scope}/eslint-config-{scoped}"))
+                            }
+                        } else {
+                            Cow::Owned(format!("{name}/eslint-config"))
+                        }
+                    } else if name.starts_with("eslint-config-") {
+                        Cow::Borrowed(name)
+                    } else {
+                        Cow::Owned(format!("eslint-config-{name}"))
+                    };
+                    let Ok(output) = Command::new("node")
+                        .arg("--eval")
+                        .arg(format!(
+                            "import('{name}').then((c) => console.log(JSON.stringify(c.default)))"
+                        ))
+                        .output()
+                    else {
+                        return None;
+                    };
+                    let deserialized = deserialize_from_json_str::<ConfigData>(
+                        &String::from_utf8_lossy(&output.stdout),
+                        JsonParserOptions::default()
+                            .with_allow_trailing_commas()
+                            .with_allow_comments(),
+                        "",
+                    );
+                    if let Some(deserialized) = deserialized.into_deserialized() {
+                        return Some(deserialized);
+                    }
+                }
                 return None;
             }
         };
